@@ -289,7 +289,7 @@ def test_embed_raise_message_is_redacted_and_retries_transient_failures(monkeypa
     embeddings._embed_query_cached.cache_clear()
     error = urllib.error.HTTPError("https://example.test/v1/embeddings", 503, "unavailable", {}, None)
 
-    with patch("urllib.request.urlopen", side_effect=error) as request, \
+    with patch("urllib.request.OpenerDirector.open", side_effect=error) as request, \
          patch("mnemosyne.core.embeddings.random.uniform", return_value=0), \
          patch("mnemosyne.core.embeddings.time.sleep"):
         with pytest.raises(RuntimeError) as excinfo:
