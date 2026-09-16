@@ -344,7 +344,7 @@ class _CredentialedNoRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise _EmbeddingPolicyError(
-            f"Refusing to follow redirect to {newurl!r} for a credentialed "
+            f"Refusing to follow redirect to {_safe_api_endpoint(newurl)} for a credentialed "
             "embedding request: urllib would forward Authorization to the "
             "redirect target. Point MNEMOSYNE_EMBEDDING_API_URL at the "
             "final endpoint URL."
@@ -434,7 +434,7 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
         # being embedded) over cleartext http:// leaks both on the wire.
         raise _EmbeddingPolicyError(
             f"Refusing to send embedding credentials over non-HTTPS endpoint "
-            f"{base_url!r}: point MNEMOSYNE_EMBEDDING_API_URL at an https:// "
+            f"{_safe_api_endpoint(base_url)}: point MNEMOSYNE_EMBEDDING_API_URL at an https:// "
             "URL, or unset MNEMOSYNE_EMBEDDING_API_KEY / OPENAI_API_KEY to "
             "embed without credentials (for example a local endpoint that "
             "needs no key)."
