@@ -468,3 +468,152 @@ def test_hindsight_import_continues_without_vector_when_embedding_raises(monkeyp
         assert conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# #735 hardening (review round): policy-error redaction, non-finite API
+# vectors, and stale derived vectors left by a failed update_working() refresh.
+# ---------------------------------------------------------------------------
+
+def test_credentialed_cleartext_policy_error_redacts_url(monkeypatch, caplog):
+    # _EmbeddingPolicyError interpolated the raw endpoint URL, so userinfo and
+    # query secrets could reach the exception text and the fail-soft consumer
+    # logs. Both must carry only the redacted endpoint.
+    monkeypatch.setenv(
+        "MNEMOSYNE_EMBEDDING_API_URL",
+        "http://user:password@example.test/v1?token=secret",
+    )
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDINGS_VIA_API", "1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+
+    def _no_request(*args, **kwargs):
+        raise AssertionError("no request may be attempted for a cleartext credentialed endpoint")
+
+    monkeypatch.setattr(embeddings.urllib.request, "urlopen", _no_request)
+    with caplog.at_level(logging.WARNING, logger="mnemosyne.core.embeddings"):
+        with pytest.raises(embeddings._EmbeddingPolicyError) as excinfo:
+            embeddings._embed_api(["private memory content"])
+
+    message = str(excinfo.value)
+    assert "non-HTTPS" in message
+    assert "http://example.test/v1" in message
+    for leaked in ("user:password", "token=secret", "secret-key", "private memory content"):
+        assert leaked not in message
+        assert leaked not in caplog.text
+
+
+def test_credentialed_redirect_policy_error_redacts_target_url():
+    # The redirect refusal echoed the raw Location target, which can carry
+    # userinfo or query secrets. It must be redacted before formatting.
+    import urllib.request
+
+    handler = embeddings._CredentialedNoRedirect()
+    request = urllib.request.Request(
+        "https://configured.example/v1/embeddings",
+        headers={"Authorization": "Bearer secret"},
+    )
+    newurl = "http://user:password@attacker.example/embed?token=secret"
+
+    with pytest.raises(embeddings._EmbeddingPolicyError) as excinfo:
+        handler.redirect_request(request, None, 302, "Found", {"Location": newurl}, newurl)
+
+    message = str(excinfo.value)
+    assert "redirect" in message
+    assert "http://attacker.example/embed" in message
+    assert "user:password" not in message
+    assert "token=secret" not in message
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_embed_raises_on_non_finite_api_vector(monkeypatch, value):
+    # A NaN/infinity response passes the shape and count checks but serializes
+    # to invalid JSON for SQLite (json_valid() = 0) and yields non-finite
+    # similarity scores. Reject it before it can reach storage.
+    _api_env(monkeypatch)
+    data = {"data": [{"embedding": [0.1, value]}]}
+
+    with patch("urllib.request.urlopen", return_value=Response(data)):
+        with pytest.raises(RuntimeError, match="non-finite"):
+            embeddings.embed(["anything"])
+
+
+def _beam_vector():
+    np = pytest.importorskip("numpy")
+    from mnemosyne.core import beam as beam_module
+
+    vector = np.array([1.0] + [0.0] * (beam_module.EMBEDDING_DIM - 1), dtype=np.float32)
+    return beam_module, vector
+
+
+def _working_embedding_count(beam, memory_id):
+    return beam.conn.execute(
+        "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (memory_id,)
+    ).fetchone()[0]
+
+
+def _seed_working_vector(beam, beam_module, monkeypatch, vector):
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+    monkeypatch.setattr(beam_module._embeddings, "embed", lambda contents: [vector])
+    memory_id = beam.remember("original content", source="test")
+    assert _working_embedding_count(beam, memory_id) == 1
+    return memory_id
+
+
+def test_update_working_invalidates_stale_vector_when_embedding_raises(monkeypatch, tmp_path):
+    beam_module, vector = _beam_vector()
+    from mnemosyne.core.beam import BeamMemory
+
+    beam = BeamMemory(session_id="stale-vector-735", db_path=tmp_path / "beam.db")
+    memory_id = _seed_working_vector(beam, beam_module, monkeypatch, vector)
+
+    def _raise(_contents):
+        raise RuntimeError("endpoint down")
+
+    monkeypatch.setattr(beam_module._embeddings, "embed", _raise)
+
+    assert beam.update_working(memory_id, content="replacement content") is True
+    # The stored vector described the previous content; it must not survive to
+    # score the new content in dense recall.
+    assert _working_embedding_count(beam, memory_id) == 0
+
+
+def test_update_working_invalidates_stale_vector_when_embed_returns_none(monkeypatch, tmp_path):
+    beam_module, vector = _beam_vector()
+    from mnemosyne.core.beam import BeamMemory
+
+    beam = BeamMemory(session_id="stale-vector-none-735", db_path=tmp_path / "beam.db")
+    memory_id = _seed_working_vector(beam, beam_module, monkeypatch, vector)
+
+    monkeypatch.setattr(beam_module._embeddings, "embed", lambda contents: None)
+
+    assert beam.update_working(memory_id, content="replacement content") is True
+    assert _working_embedding_count(beam, memory_id) == 0
+
+
+def test_update_working_invalidates_stale_vector_when_embeddings_unavailable(monkeypatch, tmp_path):
+    beam_module, vector = _beam_vector()
+    from mnemosyne.core.beam import BeamMemory
+
+    beam = BeamMemory(session_id="stale-vector-off-735", db_path=tmp_path / "beam.db")
+    memory_id = _seed_working_vector(beam, beam_module, monkeypatch, vector)
+
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: False)
+
+    assert beam.update_working(memory_id, content="replacement content") is True
+    assert _working_embedding_count(beam, memory_id) == 0
+
+
+def test_update_working_without_content_change_keeps_vector(monkeypatch, tmp_path):
+    beam_module, vector = _beam_vector()
+    from mnemosyne.core.beam import BeamMemory
+
+    beam = BeamMemory(session_id="stale-vector-keep-735", db_path=tmp_path / "beam.db")
+    memory_id = _seed_working_vector(beam, beam_module, monkeypatch, vector)
+
+    def _raise(_contents):
+        raise RuntimeError("endpoint down")
+
+    monkeypatch.setattr(beam_module._embeddings, "embed", _raise)
+
+    assert beam.update_working(memory_id, importance=0.9) is True
+    assert _working_embedding_count(beam, memory_id) == 1
