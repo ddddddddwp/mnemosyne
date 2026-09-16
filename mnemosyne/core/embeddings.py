@@ -414,6 +414,12 @@ def _ensure_api_vectors(result: Optional[np.ndarray], base_url: str, expected: i
             f"(endpoint={_safe_api_endpoint(base_url)}, model={_DEFAULT_MODEL}); "
             f"the endpoint may be returning a partial or misaligned response."
         )
+    if not np.isfinite(result).all():
+        raise RuntimeError(
+            f"Embedding API returned non-finite values (NaN or inf) "
+            f"(endpoint={_safe_api_endpoint(base_url)}, model={_DEFAULT_MODEL}); "
+            "the result is not a valid embedding vector."
+        )
     return result
 
 
